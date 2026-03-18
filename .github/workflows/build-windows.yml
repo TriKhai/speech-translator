@@ -32,9 +32,34 @@ jobs:
           pip install deep-translator silero-vad sounddevice webrtcvad-wheels
           pip install sqlalchemy python-dotenv pyinstaller
 
-      - name: Remove typing AFTER all deps installed
-        run: pip uninstall typing -y
-        continue-on-error: true
+      - name: Force remove typing package folder
+        shell: python
+        run: |
+          import sys, shutil, os
+          for p in sys.path:
+              typing_dir = os.path.join(p, 'typing')
+              typing_egg = os.path.join(p, 'typing-3.10.0.0.dist-info')
+              typing_egg2 = os.path.join(p, 'typing-3.7.4.3.dist-info')
+              for path in [typing_dir, typing_egg, typing_egg2]:
+                  if os.path.exists(path):
+                      print(f"Removing: {path}")
+                      if os.path.isdir(path):
+                          shutil.rmtree(path)
+                      else:
+                          os.remove(path)
+          # Xóa typing.py nếu có
+          for p in sys.path:
+              typing_py = os.path.join(p, 'typing.py')
+              if os.path.exists(typing_py):
+                  # Đây là stdlib, không xóa
+                  pass
+          # Xóa dist-info của typing backport
+          import glob
+          for p in sys.path:
+              for f in glob.glob(os.path.join(p, 'typing-*.dist-info')):
+                  print(f"Removing dist-info: {f}")
+                  shutil.rmtree(f)
+          print("Done removing typing backport")
 
       - name: Inject HF_TOKEN
         env:
