@@ -18,10 +18,8 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Uninstall incompatible packages
-        run: |
-          pip uninstall typing -y
-          pip uninstall torch torchaudio torchvision -y
+      - name: Uninstall CUDA torch
+        run: pip uninstall torch torchaudio torchvision -y
         continue-on-error: true
 
       - name: Install CPU-only torch
@@ -33,6 +31,10 @@ jobs:
           pip install PyQt6 faster-whisper resemblyzer pyannote.audio
           pip install deep-translator silero-vad sounddevice webrtcvad-wheels
           pip install sqlalchemy python-dotenv pyinstaller
+
+      - name: Remove typing AFTER all deps installed
+        run: pip uninstall typing -y
+        continue-on-error: true
 
       - name: Inject HF_TOKEN
         env:
