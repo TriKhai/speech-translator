@@ -1,22 +1,29 @@
+"""
+local_agreement.py  —  KHÔNG thay đổi logic nội bộ
+
+Bug #2 được fix ở transcription_worker.py (mỗi speaker có 1 instance riêng).
+File này giữ nguyên để không phá vỡ import.
+
+LocalAgreement Policy — chống text nháy.
+= LocalAgreement Policy trong WhisperLiveKit
+
+Ý tưởng:
+- Chỉ emit phần text ổn định xuất hiện ở cả chunk hiện tại lẫn chunk trước
+- Tương tự "longest common prefix" giữa 2 lần transcribe liên tiếp
+
+Ví dụ:
+    chunk t-1: "hello how are"
+    chunk t:   "hello how are you"
+    → emit:    "hello how are"  (phần chung ổn định)
+    → giữ lại: "you"            (chờ confirm ở chunk tiếp theo)
+"""
+
+
 class LocalAgreement:
-    """
-    LocalAgreement Policy — chống text nháy.
-    = LocalAgreement Policy trong WhisperLiveKit
-
-    Ý tưởng:
-    - Chỉ emit phần text ổn định xuất hiện ở cả chunk hiện tại lẫn chunk trước
-    - Tương tự "longest common prefix" giữa 2 lần transcribe liên tiếp
-
-    Ví dụ:
-        chunk t-1: "hello how are"
-        chunk t:   "hello how are you"
-        → emit:    "hello how are"  (phần chung ổn định)
-        → giữ lại: "you"            (chờ confirm ở chunk tiếp theo)
-    """
 
     def __init__(self):
         self._prev_words: list[str] = []
-        self._emitted_count: int    = 0   # số words đã emit
+        self._emitted_count: int    = 0
 
     def process(self, text: str) -> str | None:
         """
@@ -45,7 +52,6 @@ class LocalAgreement:
 
         if new_stable:
             return " ".join(new_stable)
-
         return None
 
     def flush(self) -> str | None:

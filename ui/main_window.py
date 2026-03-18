@@ -8,9 +8,9 @@ import numpy as np
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QLabel, QStackedWidget,
-    QFrame,
+    QFrame, QProgressBar,
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui  import (
     QFont, QColor, QPalette, QTextCursor, QTextCharFormat,
 )
@@ -21,6 +21,7 @@ from core.whisper_service      import WhisperService
 from core.speaker_identifier   import SpeakerIdentifier
 from core.translation_service  import TranslationService
 from core.transcription_worker import TranscriptionWorker
+from core.speaker_diarizer     import SpeakerDiarizer
 from db.database_service       import DatabaseService
 
 from ui.constants import (
@@ -61,6 +62,7 @@ class MainWindow(QMainWindow):
         self._is_recording    = False
         self._is_paused       = False
         self._current_wav     = None
+        self._saved_rec_id    = None
         self._last_speaker_en = None
         self._last_speaker_vi = None
         self._vi_only_mode    = False
@@ -71,6 +73,7 @@ class MainWindow(QMainWindow):
         self._signals.status_changed.connect(self._update_status)
         self._signals.model_loaded.connect(self._on_model_loaded)
         self._signals.audio_level.connect(self._on_audio_level)
+        self._signals.diarization_done.connect(self._on_diarization_done)
 
         self._build_ui()
         self._apply_theme()
@@ -92,6 +95,13 @@ class MainWindow(QMainWindow):
 
         # ← Thay đổi chính: dùng _default_audio_device()
         self._capture = AudioCapture(device=_default_audio_device())
+
+        self._signals.status_changed.emit("Loading Diarizer…")
+        try:
+            self._diarizer = SpeakerDiarizer()
+        except Exception as e:
+            print(f"[UI] Diarizer not available: {e}")
+            self._diarizer = None
         self._worker  = TranscriptionWorker(
             whisper       = self._whisper,
             speaker       = self._speaker,
@@ -280,7 +290,19 @@ class MainWindow(QMainWindow):
         self._card_vi, self._txt_vi = self._transcript_panel_card("🇻🇳  TIẾNG VIỆT", "#34D399")
         bl.addWidget(self._card_en)
         bl.addWidget(self._card_vi)
-        lay.addWidget(self._transcript_row, stretch=1)
+        # Diarize overlay — hiện lên trên transcript khi đang xử lý
+        self._diarize_overlay = self._build_diarize_overlay()
+        self._diarize_overlay.setVisible(False)
+
+        # Wrap transcript_row + overlay vào container
+        transcript_container = QWidget()
+        transcript_container.setStyleSheet("background:transparent;")
+        tc_lay = QVBoxLayout(transcript_container)
+        tc_lay.setContentsMargins(0, 0, 0, 0)
+        tc_lay.setSpacing(0)
+        tc_lay.addWidget(self._transcript_row, stretch=1)
+        tc_lay.addWidget(self._diarize_overlay)
+        lay.addWidget(transcript_container, stretch=1)
         return w
 
     def _build_visualizer_card(self) -> QFrame:
@@ -390,6 +412,86 @@ class MainWindow(QMainWindow):
         ctrl.addStretch()
         ctrl.addWidget(self._btn_clear)
         return ctrl
+
+    def _build_diarize_overlay(self) -> QWidget:
+        """Overlay loading hiện lên khi đang chạy post-save diarization."""
+        w = QWidget()
+        w.setStyleSheet(f"""
+            QWidget {{
+                background: rgba(13, 15, 20, 0.92);
+                border: 1px solid {BORDER};
+                border-radius: 10px;
+            }}
+        """)
+        w.setFixedHeight(80)
+
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(24, 0, 24, 0)
+        lay.setSpacing(16)
+
+        # Spinner (dots animation via QTimer)
+        self._spinner_lbl = QLabel("◉")
+        self._spinner_lbl.setFont(QFont("JetBrains Mono", 18))
+        self._spinner_lbl.setStyleSheet(f"color:{ACCENT}; background:transparent; border:none;")
+        self._spinner_lbl.setFixedWidth(32)
+
+        # Text + progress bar
+        text_col = QWidget()
+        text_col.setStyleSheet("background:transparent; border:none;")
+        tc = QVBoxLayout(text_col)
+        tc.setContentsMargins(0, 0, 0, 0)
+        tc.setSpacing(6)
+
+        self._diarize_lbl = QLabel("Re-analyzing speakers…")
+        self._diarize_lbl.setFont(QFont("JetBrains Mono", 9))
+        self._diarize_lbl.setStyleSheet(f"color:{TEXT_PRI}; background:transparent; border:none; letter-spacing:1px;")
+
+        self._diarize_sub = QLabel("pyannote diarization pipeline running")
+        self._diarize_sub.setFont(QFont("JetBrains Mono", 8))
+        self._diarize_sub.setStyleSheet(f"color:{TEXT_SEC}; background:transparent; border:none;")
+
+        self._diarize_bar = QProgressBar()
+        self._diarize_bar.setRange(0, 0)   # indeterminate / marquee
+        self._diarize_bar.setFixedHeight(3)
+        self._diarize_bar.setTextVisible(False)
+        self._diarize_bar.setStyleSheet(f"""
+            QProgressBar {{
+                background: {BORDER};
+                border: none;
+                border-radius: 2px;
+            }}
+            QProgressBar::chunk {{
+                background: {ACCENT};
+                border-radius: 2px;
+            }}
+        """)
+
+        tc.addWidget(self._diarize_lbl)
+        tc.addWidget(self._diarize_sub)
+        tc.addWidget(self._diarize_bar)
+
+        lay.addWidget(self._spinner_lbl)
+        lay.addWidget(text_col, stretch=1)
+
+        # Spinner animation
+        self._spinner_frames = ["◉", "◎", "○", "◎"]
+        self._spinner_idx    = 0
+        self._spinner_timer  = QTimer()
+        self._spinner_timer.timeout.connect(self._tick_spinner)
+
+        return w
+
+    def _tick_spinner(self):
+        self._spinner_idx = (self._spinner_idx + 1) % len(self._spinner_frames)
+        self._spinner_lbl.setText(self._spinner_frames[self._spinner_idx])
+
+    def _show_diarize_overlay(self):
+        self._diarize_overlay.setVisible(True)
+        self._spinner_timer.start(300)
+
+    def _hide_diarize_overlay(self):
+        self._spinner_timer.stop()
+        self._diarize_overlay.setVisible(False)
 
     def _toggle_pill(self, label: str, active: bool = True) -> QPushButton:
         btn = QPushButton(label)
@@ -598,16 +700,15 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_vad"):
             self._vad.reset()
         self._worker.stop()
+
+        self._saved_rec_id = self._db._current_rec_id
         self._db.stop_recording()
 
         self._set_btn_start()
         self._btn_pause.setEnabled(False)
         self._btn_save.setEnabled(False)
         self._btn_discard.setEnabled(False)
-        self._lbl_rec_status.setText("✔ Saved — playing back")
-        self._lbl_rec_status.setStyleSheet("color:#34D399; background:transparent;")
         self._dot.setStyleSheet(f"color:{TEXT_SEC}; font-size:9px; border:none;")
-        self._update_status("ready")
 
         if self._current_wav:
             self._player.load(self._current_wav)
@@ -616,6 +717,62 @@ class MainWindow(QMainWindow):
         print(f"[UI] Saved: {self._current_wav}")
         if hasattr(self, "_history_page") and hasattr(self, "_db"):
             self._history_page.refresh()
+
+        # Kick off diarization + show overlay
+        if (hasattr(self, "_diarizer") and self._diarizer
+                and self._current_wav and self._saved_rec_id):
+            self._lbl_rec_status.setText("✔ Saved — re-analyzing speakers…")
+            self._lbl_rec_status.setStyleSheet("color:#FBBF24; background:transparent;")
+            self._update_status("diarizing")
+            self._show_diarize_overlay()
+            import threading
+            threading.Thread(
+                target=self._run_diarization,
+                args=(self._saved_rec_id, self._current_wav),
+                daemon=True,
+            ).start()
+        else:
+            self._lbl_rec_status.setText("✔ Saved — playing back")
+            self._lbl_rec_status.setStyleSheet("color:#34D399; background:transparent;")
+            self._update_status("ready")
+
+    def _run_diarization(self, recording_id: str, wav_path: str):
+        print(f"[DIARIZE] Starting post-save diarization: {wav_path}")
+        try:
+            turns = self._diarizer.diarize(wav_path)
+            if not turns:
+                self._signals.diarization_done.emit(recording_id, False)
+                return
+            db_segs     = self._db.get_recording_segments(recording_id)
+            assignments = self._diarizer.assign_speakers(turns, db_segs)
+            if assignments:
+                self._db.update_segment_speakers(recording_id, assignments)
+            self._signals.diarization_done.emit(recording_id, bool(assignments))
+        except Exception as e:
+            print(f"[DIARIZE] Error: {e}")
+            import traceback; traceback.print_exc()
+            self._signals.diarization_done.emit(recording_id, False)
+
+    def _on_diarization_done(self, recording_id: str, success: bool):
+        self._hide_diarize_overlay()
+        if success:
+            self._lbl_rec_status.setText("✔ Saved — speaker labels updated")
+            self._lbl_rec_status.setStyleSheet("color:#34D399; background:transparent;")
+            self._reload_transcript(recording_id)
+            if hasattr(self, "_history_page"):
+                self._history_page.refresh()
+        else:
+            self._lbl_rec_status.setText("✔ Saved — playing back")
+            self._lbl_rec_status.setStyleSheet("color:#34D399; background:transparent;")
+        self._update_status("ready")
+
+    def _reload_transcript(self, recording_id: str):
+        self._clear_transcript()
+        segments = self._db.get_recording_segments(recording_id)
+        for seg in segments:
+            spk_idx = seg["speaker_index"]
+            self._insert_text(self._txt_en, seg["text_en"], spk_idx, is_en=True)
+            self._insert_text(self._txt_vi, seg["text_vi"], spk_idx, is_en=False)
 
     def _on_new_recording(self):
         self._player.stop()

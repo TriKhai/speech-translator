@@ -1,7 +1,26 @@
+"""
+translation_service.py  —  FIX #7
+
+Vấn đề gốc:
+    1 lần timeout hoặc lỗi mạng → mất luôn đoạn dịch.
+    Fallback về text EN nhưng không thử lại, người dùng thấy EN thay vì VI
+    mà không biết là do lỗi dịch.
+
+Fix đã áp dụng:
+    - Retry tối đa 3 lần với exponential backoff: 1s → 2s → 4s
+    - Log rõ ràng mỗi lần thử lại
+    - Chỉ sau khi hết 3 lần mới fallback về text gốc
+    - Thêm kiểm tra kết quả rỗng (GoogleTranslator đôi khi trả về None)
+"""
+
+import time
 from deep_translator import GoogleTranslator
 
 
 class TranslationService:
+
+    MAX_RETRIES = 3   # số lần thử tối đa
+    BACKOFF_BASE = 1  # giây, tăng theo lũy thừa 2: 1s, 2s, 4s
 
     def __init__(self):
         print("[TRANSLATE] TranslationService ready.")
@@ -9,10 +28,32 @@ class TranslationService:
     def translate(self, text: str, src: str = "en", dest: str = "vi") -> str:
         if not text.strip():
             return text
-        try:
-            result = GoogleTranslator(source=src, target=dest).translate(text)
-            print(f"[TRANSLATE] {text} → {result}")
-            return result
-        except Exception as e:
-            print(f"[TRANSLATE] Error: {e} — trả về text gốc")
-            return text
+
+        last_error = None
+
+        # FIX #7: Retry với exponential backoff thay vì thất bại ngay lần đầu
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                result = GoogleTranslator(source=src, target=dest).translate(text)
+
+                # Kiểm tra kết quả hợp lệ (GoogleTranslator đôi khi trả None)
+                if result and result.strip():
+                    print(f"[TRANSLATE] OK (lần {attempt + 1}): "
+                          f"{text[:30]}... → {result[:30]}...")
+                    return result
+                else:
+                    raise ValueError(f"Kết quả dịch rỗng (attempt {attempt + 1})")
+
+            except Exception as e:
+                last_error = e
+                if attempt < self.MAX_RETRIES - 1:
+                    wait = self.BACKOFF_BASE * (2 ** attempt)   # 1s, 2s, 4s
+                    print(f"[TRANSLATE] Lỗi lần {attempt + 1}/{self.MAX_RETRIES}: "
+                          f"{e} — thử lại sau {wait}s")
+                    time.sleep(wait)
+                else:
+                    print(f"[TRANSLATE] Thất bại sau {self.MAX_RETRIES} lần: {e}")
+
+        # Hết retry → fallback về text gốc, KHÔNG crash
+        print(f"[TRANSLATE] Fallback về text gốc: {text[:40]}...")
+        return text

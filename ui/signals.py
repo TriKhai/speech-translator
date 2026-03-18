@@ -1,4 +1,3 @@
-
 from PyQt6.QtCore import QObject, pyqtSignal
 
 class AppSignals(QObject):
@@ -7,3 +6,4 @@ class AppSignals(QObject):
     status_changed      = pyqtSignal(str)
     model_loaded        = pyqtSignal()
     audio_level         = pyqtSignal(float)
+    diarization_done    = pyqtSignal(str, bool)

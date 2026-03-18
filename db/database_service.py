@@ -1,10 +1,15 @@
+"""
+database_service.py — Thêm update_segment_speakers() cho post-save diarization
+"""
+
 import time
 import os
 from datetime import datetime
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from db.models import init_db, Recording, Speaker, Segment, Word, DB_PATH
 
-# Heo
+
 class DatabaseService:
 
     def __init__(self, db_path: str = DB_PATH):
@@ -43,43 +48,103 @@ class DatabaseService:
         with Session(self._engine) as session:
             rec = session.get(Recording, self._current_rec_id)
             if rec:
+                word_count_result = session.execute(
+                    select(func.sum(
+                        func.length(Segment.text_en)
+                        - func.length(func.replace(Segment.text_en, " ", ""))
+                        + 1
+                    )).where(
+                        Segment.recording_id == self._current_rec_id,
+                        func.length(func.trim(Segment.text_en)) > 0,
+                    )
+                ).scalar()
+
                 rec.duration_seconds = round(duration, 2)
                 rec.status           = "done"
                 rec.speaker_count    = len(self._speaker_map)
-                rec.word_count       = sum(
-                    len(seg.text_en.split()) for seg in rec.segments
-                )
+                rec.word_count       = int(word_count_result or 0)
                 session.commit()
-                print(f"[DB] Stopped: {rec.id[:8]} ({duration:.1f}s)")
+                print(f"[DB] Stopped: {rec.id[:8]} ({duration:.1f}s, {rec.word_count} words)")
 
         self._current_rec_id = None
         self._start_ts       = None
 
     def delete_recording(self, recording_id: str):
-        """
-        Xóa hoàn toàn 1 recording khỏi DB:
-        - Xóa tất cả Words, Segments, Speakers liên quan (cascade)
-        - Xóa Recording row
-        - Xóa file WAV nếu tồn tại
-
-        SQLAlchemy cascade="all, delete-orphan" đã được khai báo
-        trong models.py nên chỉ cần xóa Recording row là đủ.
-        """
         with Session(self._engine) as session:
             rec = session.get(Recording, recording_id)
             if rec:
                 audio_path = rec.audio_path
                 session.delete(rec)
                 session.commit()
-                print(f"[DB] Deleted recording: {recording_id[:8]}")
-
-                # Xóa file WAV
+                print(f"[DB] Deleted: {recording_id[:8]}")
                 if audio_path and os.path.exists(audio_path):
                     try:
                         os.remove(audio_path)
-                        print(f"[DB] Deleted audio: {audio_path}")
                     except Exception as e:
                         print(f"[DB] Could not delete audio: {e}")
+
+    # ──────────────────────────────────────────────────────
+    # Post-save diarization: re-assign speaker labels
+    # ──────────────────────────────────────────────────────
+    def update_segment_speakers(
+        self,
+        recording_id: str,
+        speaker_assignments: dict[int, int],
+    ):
+        """
+        Cập nhật speaker_id cho các segment sau khi diarization xong.
+
+        Args:
+            recording_id:        UUID của recording
+            speaker_assignments: {segment_index: new_speaker_index}
+                                 Output từ SpeakerDiarizer.assign_speakers()
+        """
+        if not speaker_assignments:
+            print("[DB] update_segment_speakers: nothing to update")
+            return
+
+        with Session(self._engine) as session:
+            # Reset speaker_map để tạo lại từ đầu
+            new_speaker_map: dict[int, str] = {}   # speaker_index → speaker UUID
+
+            updated = 0
+            for seg_idx, new_spk_idx in speaker_assignments.items():
+                seg = session.query(Segment).filter(
+                    Segment.recording_id  == recording_id,
+                    Segment.segment_index == seg_idx,
+                ).first()
+
+                if seg is None:
+                    continue
+
+                # Tạo hoặc lấy Speaker row cho new_spk_idx
+                if new_spk_idx not in new_speaker_map:
+                    spk = session.query(Speaker).filter(
+                        Speaker.recording_id  == recording_id,
+                        Speaker.speaker_index == new_spk_idx,
+                    ).first()
+
+                    if spk is None:
+                        spk = Speaker(
+                            recording_id  = recording_id,
+                            speaker_index = new_spk_idx,
+                        )
+                        session.add(spk)
+                        session.flush()
+
+                    new_speaker_map[new_spk_idx] = spk.id
+
+                seg.speaker_id = new_speaker_map[new_spk_idx]
+                updated += 1
+
+            # Cập nhật speaker_count trên Recording
+            rec = session.get(Recording, recording_id)
+            if rec:
+                rec.speaker_count = len(new_speaker_map)
+
+            session.commit()
+            print(f"[DB] Updated {updated} segments → "
+                  f"{len(new_speaker_map)} speakers for {recording_id[:8]}")
 
     # ──────────────────────────────────────────────────────
     # Speaker
@@ -144,9 +209,8 @@ class DatabaseService:
             self._segment_index += 1
             print(f"[DB] Saved segment #{self._segment_index} "
                   f"Speaker {speaker_index}: {text_en[:40]}")
-            
+
     def get_current_segments(self) -> list[dict]:
-        """Trả về segments của recording hiện tại — dùng sau stop_recording()."""
         if not self._current_rec_id:
             return []
         return self.get_recording_segments(self._current_rec_id)

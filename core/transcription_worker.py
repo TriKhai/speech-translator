@@ -1,45 +1,48 @@
+"""
+transcription_worker.py — Fix SpeakerBuffer không gộp chunk
+
+Bugs từ log:
+    1. Buffer luôn "gán cho 1 chunk" vì LocalAgreement trả None cho chunk 2, 3
+       → code `if not stable: continue` bỏ qua chunk → buffer không tích lũy
+       Fix: tích lũy PCM vào buffer TRƯỚC khi check stable text
+
+    2. Speaker 3 tạo tại score=0.141, 0.253 (quá thấp = chunk bị cắt/nhiễu)
+       Fix: MIN_CONFIDENCE_SCORE — nếu best_score < ngưỡng này thì giữ speaker cũ
+       thay vì tạo speaker mới (xử lý trong speaker_identifier.py)
+"""
+
 import time
 import queue
 import threading
 import concurrent.futures
+from dataclasses import dataclass
+
 from core.whisper_service     import WhisperService
 from core.local_agreement     import LocalAgreement
 from core.speaker_identifier  import SpeakerIdentifier
 from core.translation_service import TranslationService
 from db.database_service      import DatabaseService
 
+BYTES_PER_SECOND      = 32000
+SPEAKER_BUFFER_CHUNKS = 3   # gộp 3 chunk PCM (~4.5s) rồi identify 1 lần
+
+
+@dataclass
+class _PendingChunk:
+    stable:      str
+    chunk_start: float
+    chunk_end:   float
+    confidence:  float
+    words:       list
+    future_vi:   object = None
+
 
 class TranscriptionWorker:
-    """
-    Pipeline với 2 mode:
-
-    Mode "both" (mặc định):
-        Whisper + Speaker song song
-        → submit translate NGAY khi có text (song song với emit EN)
-        → emit EN ngay
-        → emit VI khi dịch xong (delay ≈ 0 vì đã chạy song song)
-
-    Mode "vi_only":
-        Giống "both" nhưng KHÔNG emit EN
-        → chỉ emit VI khi dịch xong
-
-    Cải thiện delay so với bản cũ:
-        Cũ:  whisper(2s) → emit EN → translate(1s) → emit VI   = 3s total
-        Mới: whisper(2s) song song translate(1s) → emit EN+VI  = 2s total
-    """
 
     MODE_BOTH    = "both"
     MODE_VI_ONLY = "vi_only"
 
-    def __init__(
-        self,
-        whisper:       WhisperService,
-        speaker:       SpeakerIdentifier,
-        translator:    TranslationService,
-        db:            DatabaseService,
-        on_english:    callable,
-        on_vietnamese: callable,
-    ):
+    def __init__(self, whisper, speaker, translator, db, on_english, on_vietnamese):
         self._whisper       = whisper
         self._speaker       = speaker
         self._translator    = translator
@@ -47,46 +50,44 @@ class TranscriptionWorker:
         self._on_english    = on_english
         self._on_vietnamese = on_vietnamese
 
-        self._mode          = self.MODE_BOTH
-        self._queue         = queue.Queue(maxsize=2)
-        self._bg_pool       = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-        self._agreement     = LocalAgreement()
-        self._running       = False
-        self._thread        = None
-        self._session_start = None
+        self._mode    = self.MODE_BOTH
+        self._queue   = queue.Queue(maxsize=4)
+        self._bg_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        self._agreements: dict[int, LocalAgreement] = {}
+
+        # Speaker buffer
+        self._spk_pcm_buf:     list[bytes]         = []
+        self._spk_pending:     list[_PendingChunk] = []
+        self._last_speaker_id: int                 = 1
+
+        self._running        = False
+        self._thread         = None
+        self._bytes_received = 0
 
     def set_mode(self, mode: str):
-        """
-        Đổi mode realtime (hiệu lực từ chunk tiếp theo).
-            "both"    → hiện EN + VI
-            "vi_only" → chỉ hiện VI
-        """
         assert mode in (self.MODE_BOTH, self.MODE_VI_ONLY)
         self._mode = mode
-        print(f"[WORKER] Mode → {mode}")
 
     def start(self):
         self._running        = True
-        self._session_start  = time.time()
-        self._bytes_received = 0   # tổng bytes PCM đã nhận, dùng để tính offset chính xác
-        self._agreement.reset()
+        self._bytes_received = 0
+        self._agreements.clear()
+        self._spk_pcm_buf.clear()
+        self._spk_pending.clear()
+        self._last_speaker_id = 1
         self._thread = threading.Thread(target=self._process_loop, daemon=True)
         self._thread.start()
 
     def enqueue(self, chunk: bytes, is_final: bool = False):
-        # Tính offset của chunk này trong WAV dựa trên bytes đã nhận
-        # BYTES_PER_SECOND = 16000 Hz * 2 bytes (s16le) = 32000
-        BYTES_PER_SECOND = 32000
-        chunk_offset_sec = self._bytes_received / BYTES_PER_SECOND
+        offset = self._bytes_received / BYTES_PER_SECOND
         self._bytes_received += len(chunk)
-
         if self._queue.full():
             try:
                 self._queue.get_nowait()
                 print("[WORKER] Queue full — dropped oldest chunk.")
             except queue.Empty:
                 pass
-        self._queue.put_nowait((chunk, is_final, chunk_offset_sec))
+        self._queue.put_nowait((chunk, is_final, offset))
 
     def stop(self):
         self._running = False
@@ -97,36 +98,54 @@ class TranscriptionWorker:
         if self._thread:
             self._thread.join(timeout=5)
 
-    # ── Helpers 
-    def _save_to_db(self, text_en, text_vi, speaker_id,
-                    start_time, end_time, confidence, words):
-        self._db.save_segment(
-            text_en       = text_en,
-            text_vi       = text_vi,
-            speaker_index = speaker_id,
-            start_time    = start_time,
-            end_time      = end_time,
-            confidence    = confidence,
-            words         = words,
-        )
+    def _get_agreement(self, speaker_id: int) -> LocalAgreement:
+        if speaker_id not in self._agreements:
+            self._agreements[speaker_id] = LocalAgreement()
+        return self._agreements[speaker_id]
+
+    def _flush_speaker_buffer(self, is_final: bool = False):
+        """
+        Identify speaker từ PCM đã gộp rồi emit tất cả pending chunks.
+        Chỉ gọi khi buffer đủ SPEAKER_BUFFER_CHUNKS hoặc is_final.
+        """
+        if not self._spk_pcm_buf:
+            return
+
+        combined_pcm = b"".join(self._spk_pcm_buf)
+        speaker_id   = self._speaker.identify(combined_pcm)
+        self._last_speaker_id = speaker_id
+        print(f"[WORKER] Speaker {speaker_id} → "
+              f"gán cho {len(self._spk_pending)} pending chunk(s)")
+
+        for p in self._spk_pending:
+            if self._mode == self.MODE_BOTH:
+                self._on_english(p.stable, speaker_id)
+            self._bg_pool.submit(
+                self._finish_vi,
+                p.stable, speaker_id,
+                p.chunk_start, p.chunk_end,
+                p.confidence, p.words,
+                p.future_vi,
+            )
+
+        self._spk_pending.clear()
+        self._spk_pcm_buf.clear()
 
     def _finish_vi(self, stable, speaker_id, chunk_start, chunk_end,
                    confidence, words, future_vi):
-        """
-        Chạy trên bg_pool — đợi future_vi (đã đang chạy song song)
-        rồi emit VI + lưu DB.
-        """
         try:
             text_vi = future_vi.result(timeout=10)
         except Exception as e:
             print(f"[WORKER] Translate error: {e}")
-            text_vi = stable    # fallback: hiện EN nếu dịch lỗi
-
+            text_vi = stable
         self._on_vietnamese(text_vi, speaker_id)
-        self._save_to_db(stable, text_vi, speaker_id,
-                         chunk_start, chunk_end, confidence, words)
+        self._db.save_segment(
+            text_en=stable, text_vi=text_vi,
+            speaker_index=speaker_id,
+            start_time=chunk_start, end_time=chunk_end,
+            confidence=confidence, words=words,
+        )
 
-    # ── Main loop 
     def _process_loop(self):
         while self._running:
             try:
@@ -135,67 +154,78 @@ class TranscriptionWorker:
                 continue
 
             if item is None:
+                # Flush còn lại khi stop
+                if self._spk_pcm_buf:
+                    print(f"[WORKER] Stop flush: {len(self._spk_pending)} chunk(s)")
+                    self._flush_speaker_buffer(is_final=True)
                 break
 
             chunk, is_final, chunk_offset_sec = item
 
             try:
-                # 1. Whisper + Speaker song song
-                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-                    f_asr = ex.submit(self._whisper.transcribe_full, chunk)
-                    f_spk = ex.submit(self._speaker.identify, chunk)
-                    result     = f_asr.result()
-                    speaker_id = f_spk.result()
-
-                if not result.text.strip():
-                    continue
-
-                # start_time = offset chunk trong WAV
-                # end_time   = offset + duration chunk (bytes → giây)
-                BYTES_PER_SECOND = 32000
                 chunk_start = chunk_offset_sec
                 chunk_end   = chunk_offset_sec + len(chunk) / BYTES_PER_SECOND
-                print(f"[WORKER] Speaker {speaker_id} [{chunk_start:.1f}s→{chunk_end:.1f}s]: {result.text}")
 
-                # Adjust word timestamps: Whisper trả về offset trong chunk
-                # → cộng chunk_offset_sec để ra offset trong toàn bộ WAV
-                adjusted_words = []
-                for w in (result.words or []):
-                    adjusted_words.append({
+                # ── FIX: Tích lũy PCM vào buffer TRƯỚC mọi thứ khác ─────────
+                # Không để LocalAgreement/stable check chặn việc gom PCM
+                self._spk_pcm_buf.append(chunk)
+
+                # ── Whisper ─────────────────────────────────────────────────
+                result = self._whisper.transcribe_full(chunk)
+
+                if not result.text.strip():
+                    # Chunk không có text — vẫn đếm vào buffer PCM
+                    # Khi đủ chunk thì flush với speaker trước đó
+                    if len(self._spk_pcm_buf) >= SPEAKER_BUFFER_CHUNKS or is_final:
+                        if self._spk_pending:
+                            self._flush_speaker_buffer(is_final)
+                        else:
+                            # Không có pending text, chỉ xoá PCM buffer
+                            self._spk_pcm_buf.clear()
+                    continue
+
+                print(f"[WORKER] [{chunk_start:.1f}s→{chunk_end:.1f}s]: {result.text}")
+
+                adjusted_words = [
+                    {
                         "word":        w["word"],
                         "start":       round(w["start"] + chunk_offset_sec, 3),
                         "end":         round(w["end"]   + chunk_offset_sec, 3),
                         "probability": w["probability"],
-                    })
+                    }
+                    for w in (result.words or [])
+                ]
 
-                # 2. LocalAgreement → lấy stable text
+                # LocalAgreement dùng last_speaker_id tạm
+                agreement = self._get_agreement(self._last_speaker_id)
                 if is_final:
-                    self._agreement.process(result.text)
-                    stable = self._agreement.flush()
-                    self._agreement.reset()
+                    agreement.process(result.text)
+                    stable = agreement.flush()
+                    agreement.reset()
                 else:
-                    stable = self._agreement.process(result.text)
+                    stable = agreement.process(result.text)
 
                 if not stable:
+                    # Chưa stable — vẫn giữ chunk trong PCM buffer, chờ flush sau
                     continue
 
-                # 3. Submit translate NGAY — chạy song song với emit EN + UI
-                future_vi = self._bg_pool.submit(
-                    self._translator.translate, stable
-                )
+                # Submit dịch ngay (song song)
+                future_vi = self._bg_pool.submit(self._translator.translate, stable)
 
-                # 4. Emit EN (chỉ mode both)
-                if self._mode == self.MODE_BOTH:
-                    self._on_english(stable, speaker_id)
+                # Thêm vào pending — sẽ emit khi flush_speaker_buffer
+                self._spk_pending.append(_PendingChunk(
+                    stable      = stable,
+                    chunk_start = chunk_start,
+                    chunk_end   = chunk_end,
+                    confidence  = result.confidence,
+                    words       = adjusted_words,
+                    future_vi   = future_vi,
+                ))
 
-                # 5. Đợi VI + lưu DB (nền) — future_vi đang chạy song song
-                self._bg_pool.submit(
-                    self._finish_vi,
-                    stable, speaker_id,
-                    chunk_start, chunk_end,
-                    result.confidence, adjusted_words,
-                    future_vi,
-                )
+                # Flush khi buffer đủ hoặc là chunk cuối
+                if len(self._spk_pcm_buf) >= SPEAKER_BUFFER_CHUNKS or is_final:
+                    self._flush_speaker_buffer(is_final)
 
             except Exception as e:
                 print(f"[WORKER] Error: {e}")
+                import traceback; traceback.print_exc()
