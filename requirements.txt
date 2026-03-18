@@ -1,0 +1,26 @@
+# ══════════════════════════════════════════════════════════
+# requirements.txt — cross-platform
+# ══════════════════════════════════════════════════════════
+
+# UI
+PyQt6>=6.6.0
+
+# STT
+faster-whisper>=1.0.0
+
+# Speaker diarization
+pyannote.audio>=3.1.0
+torch>=2.0.0
+
+# VAD
+silero-vad>=5.0.0
+
+# Translation
+deep-translator>=1.11.0
+
+# Audio — cross-platform
+sounddevice>=0.4.6       # Windows playback + capture
+numpy>=1.24.0
+
+# Build
+pyinstaller>=6.0.0
