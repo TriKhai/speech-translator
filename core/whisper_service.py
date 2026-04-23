@@ -12,7 +12,8 @@ class TranscribeResult:
 
 class WhisperService:
 
-    def __init__(self, model_path: str = "./models/small.en", device: str = "cpu"):
+    def __init__(self, model_path: str = "./models/tiny.en", device: str = "cpu",
+                 initial_prompt: str = ""):
         print(f"[WHISPER] Loading model: {model_path} on {device}...")
         self._model = WhisperModel(
             model_path,
@@ -20,6 +21,7 @@ class WhisperService:
             compute_type="int8",
             cpu_threads=8,
         )
+        self._initial_prompt = initial_prompt or ""
         print("[WHISPER] Model loaded.")
 
     def transcribe(self, pcm_bytes: bytes) -> str:
@@ -36,13 +38,26 @@ class WhisperService:
 
         audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
+        # segments, _ = self._model.transcribe(
+        #     audio,
+        #     language="en",
+        #     beam_size=5,
+        #     word_timestamps=True,       # bật word-level timestamps
+        #     vad_filter=True,
+        #     vad_parameters=dict(min_silence_duration_ms=500),
+        # )
+
         segments, _ = self._model.transcribe(
             audio,
             language="en",
             beam_size=5,
-            word_timestamps=True,       # bật word-level timestamps
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500),
+            word_timestamps=True,
+            no_speech_threshold=0.6,
+            log_prob_threshold=-1.0,
+            compression_ratio_threshold=2.4,
+            condition_on_previous_text=False,
+            repetition_penalty=1.2,
+            initial_prompt=self._initial_prompt or None,
         )
 
         all_words  = []

@@ -1,18 +1,3 @@
-"""
-translation_service.py  —  FIX #7
-
-Vấn đề gốc:
-    1 lần timeout hoặc lỗi mạng → mất luôn đoạn dịch.
-    Fallback về text EN nhưng không thử lại, người dùng thấy EN thay vì VI
-    mà không biết là do lỗi dịch.
-
-Fix đã áp dụng:
-    - Retry tối đa 3 lần với exponential backoff: 1s → 2s → 4s
-    - Log rõ ràng mỗi lần thử lại
-    - Chỉ sau khi hết 3 lần mới fallback về text gốc
-    - Thêm kiểm tra kết quả rỗng (GoogleTranslator đôi khi trả về None)
-"""
-
 import time
 from deep_translator import GoogleTranslator
 

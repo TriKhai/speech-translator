@@ -4,10 +4,11 @@ database_service.py — Thêm update_segment_speakers() cho post-save diarizatio
 
 import time
 import os
+import json
 from datetime import datetime
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
-from db.models import init_db, Recording, Speaker, Segment, Word, DB_PATH
+from db.models import init_db, Recording, Speaker, Segment, Word, Summary, DB_PATH
 
 
 class DatabaseService:
@@ -23,16 +24,18 @@ class DatabaseService:
     # ──────────────────────────────────────────────────────
     # Recording lifecycle
     # ──────────────────────────────────────────────────────
-    def start_recording(self, title: str = None, audio_path: str = None) -> str:
+    def start_recording(self, title: str = None, audio_path: str = None, source: str = "live", duration: float = None) -> str:
         self._start_ts      = time.time()
         self._segment_index = 0
         self._speaker_map   = {}
+        self._audio_duration_override = duration
 
         with Session(self._engine) as session:
             rec = Recording(
                 title      = title or f"Recording {datetime.now().strftime('%d/%m/%Y %H:%M')}",
                 status     = "recording",
                 audio_path = audio_path,
+                source     = source,
             )
             session.add(rec)
             session.commit()
@@ -43,7 +46,12 @@ class DatabaseService:
     def stop_recording(self):
         if not self._current_rec_id:
             return
-        duration = time.time() - self._start_ts if self._start_ts else 0
+        # Dùng duration thật của audio nếu có (upload), không dùng CPU time
+        override = getattr(self, "_audio_duration_override", None)
+        duration = override if override is not None else (
+            time.time() - self._start_ts if self._start_ts else 0
+        )
+        self._audio_duration_override = None   # reset
 
         with Session(self._engine) as session:
             rec = session.get(Recording, self._current_rec_id)
@@ -232,9 +240,28 @@ class DatabaseService:
                     "word_count":       r.word_count,
                     "status":           r.status,
                     "audio_path":       r.audio_path,
+                    "source":           getattr(r, "source", "live"),
                 }
                 for r in recs
             ]
+
+    def get_recording(self, recording_id: str) -> dict | None:
+        """Lấy 1 recording theo ID. Trả về dict hoặc None."""
+        with Session(self._engine) as session:
+            r = session.get(Recording, recording_id)
+            if not r:
+                return None
+            return {
+                "id":               r.id,
+                "title":            r.title,
+                "recorded_at":      r.recorded_at,
+                "duration_seconds": r.duration_seconds,
+                "speaker_count":    r.speaker_count,
+                "word_count":       r.word_count,
+                "status":           r.status,
+                "audio_path":       r.audio_path,
+                "source":           getattr(r, "source", "live"),
+            }
 
     def get_recording_segments(self, recording_id: str) -> list[dict]:
         with Session(self._engine) as session:
@@ -302,6 +329,134 @@ class DatabaseService:
                 for s in segs
             ]
 
+    # ──────────────────────────────────────────────────────
+    # Summary
+    # ──────────────────────────────────────────────────────
+    def save_summary(self, recording_id: str, result) -> None:
+        """
+        Lưu hoặc cập nhật summary cho một recording.
+        result: SummaryResult object từ summary_service.
+        """
+        with Session(self._engine) as session:
+            existing = session.query(Summary)\
+                              .filter(Summary.recording_id == recording_id)\
+                              .first()
+            if existing:
+                existing.summary      = result.summary
+                existing.key_points   = json.dumps(result.key_points,   ensure_ascii=False)
+                existing.action_items = json.dumps(result.action_items, ensure_ascii=False)
+                existing.topics       = json.dumps(result.topics,       ensure_ascii=False)
+                existing.sentiment    = result.sentiment
+            else:
+                session.add(Summary(
+                    recording_id = recording_id,
+                    summary      = result.summary,
+                    key_points   = json.dumps(result.key_points,   ensure_ascii=False),
+                    action_items = json.dumps(result.action_items, ensure_ascii=False),
+                    topics       = json.dumps(result.topics,       ensure_ascii=False),
+                    sentiment    = result.sentiment,
+                ))
+            session.commit()
+            print(f"[DB] Summary saved for {recording_id[:8]}")
+
+    def get_summary(self, recording_id: str) -> dict | None:
+        """
+        Lấy summary đã lưu cho một recording.
+        Trả về dict hoặc None nếu chưa có.
+        """
+        with Session(self._engine) as session:
+            row = session.query(Summary)\
+                         .filter(Summary.recording_id == recording_id)\
+                         .first()
+            if not row:
+                return None
+            return {
+                "summary":      row.summary,
+                "key_points":   json.loads(row.key_points   or "[]"),
+                "action_items": json.loads(row.action_items or "[]"),
+                "topics":       json.loads(row.topics       or "[]"),
+                "sentiment":    row.sentiment,
+                "updated_at":   row.updated_at,
+            }
+        
+    def update_action_items(self, recording_id: str, action_items: list[str]) -> None:
+        """Cập nhật danh sách action items (đã lưu trạng thái checked bằng prefix '✔ ')."""
+        with Session(self._engine) as session:
+            row = session.query(Summary)\
+                         .filter(Summary.recording_id == recording_id)\
+                         .first()
+            if row:
+                row.action_items = json.dumps(action_items, ensure_ascii=False)
+                session.commit()
+                print(f"[DB] Action items updated for {recording_id[:8]}")
+
+
+    def save_mindmap(self, recording_id: str, result) -> None:
+        """Lưu mindmap JSON vào bảng summaries (upsert)."""
+        with Session(self._engine) as session:
+            row = session.query(Summary)\
+                         .filter(Summary.recording_id == recording_id)\
+                         .first()
+            if row:
+                row.mindmap_json = json.dumps(
+                    {"central": result.central, "branches": result.branches},
+                    ensure_ascii=False
+                )
+            else:
+                session.add(Summary(
+                    recording_id = recording_id,
+                    mindmap_json = json.dumps(
+                        {"central": result.central, "branches": result.branches},
+                        ensure_ascii=False
+                    ),
+                ))
+            session.commit()
+            print(f"[DB] Mindmap saved for {recording_id[:8]}")
+
+    def get_mindmap(self, recording_id: str) -> dict | None:
+        """Lấy mindmap đã lưu. Trả về dict hoặc None."""
+        with Session(self._engine) as session:
+            row = session.query(Summary)\
+                         .filter(Summary.recording_id == recording_id)\
+                         .first()
+            if not row or not row.mindmap_json:
+                return None
+            return json.loads(row.mindmap_json)
+
+    def save_minutes(self, recording_id: str, minutes_text: str) -> None:
+        """Lưu hoặc cập nhật biên bản họp (markdown) cho một recording."""
+        with Session(self._engine) as session:
+            row = session.query(Summary)\
+                         .filter(Summary.recording_id == recording_id)\
+                         .first()
+            if row:
+                row.minutes_text = minutes_text
+            else:
+                session.add(Summary(
+                    recording_id = recording_id,
+                    minutes_text = minutes_text,
+                ))
+            session.commit()
+            print(f"[DB] Minutes saved for {recording_id[:8]}")
+
+    def get_minutes(self, recording_id: str) -> str | None:
+        """Lấy biên bản đã lưu. Trả về chuỗi markdown hoặc None nếu chưa có."""
+        with Session(self._engine) as session:
+            row = session.query(Summary)\
+                         .filter(Summary.recording_id == recording_id)\
+                         .first()
+            if not row or not row.minutes_text:
+                return None
+            return row.minutes_text
+
+    def rename_recording(self, recording_id: str, new_title: str):
+        with Session(self._engine) as session:
+            rec = session.get(Recording, recording_id)
+            if rec:
+                rec.title = new_title
+                session.commit()
+                print(f"[DB] Renamed recording {recording_id[:8]} → {new_title}")
+
     def rename_speaker(self, recording_id: str, speaker_index: int, new_label: str):
         with Session(self._engine) as session:
             spk = session.query(Speaker)\
@@ -313,3 +468,7 @@ class DatabaseService:
                 spk.label = new_label
                 session.commit()
                 print(f"[DB] Renamed Speaker {speaker_index} → {new_label}")
+
+    def update_recording_title(self, recording_id: str, title: str):
+        """Alias của rename_recording để tương thích."""
+        self.rename_recording(recording_id, title)

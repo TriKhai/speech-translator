@@ -1,5 +1,6 @@
 import uuid
 import os
+import json
 from datetime import datetime, timezone
 from sqlalchemy import (
     create_engine, Column, String, Float,
@@ -16,8 +17,7 @@ def _uuid() -> str:
     return str(uuid.uuid4())
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
+    return datetime.now()
 
 class Recording(Base):
     __tablename__ = "recordings"
@@ -30,13 +30,16 @@ class Recording(Base):
     status           = Column(String,  default="recording")  # recording | done
     speaker_count    = Column(Integer, default=0)
     word_count       = Column(Integer, default=0)
-    audio_path       = Column(String,  nullable=True)  # path tới file WAV
+    audio_path       = Column(String,  nullable=True)
+    source           = Column(String,  default="live") # live / upload
 
     segments = relationship("Segment", back_populates="recording",
                             cascade="all, delete-orphan",
                             order_by="Segment.segment_index")
     speakers = relationship("Speaker", back_populates="recording",
                             cascade="all, delete-orphan")
+    summary  = relationship("Summary", back_populates="recording",
+                            cascade="all, delete-orphan", uselist=False)
 
 
 class Speaker(Base):
@@ -91,6 +94,24 @@ class Word(Base):
 
     segment   = relationship("Segment",   back_populates="words")
     recording = relationship("Recording")
+
+
+class Summary(Base):
+    __tablename__ = "summaries"
+
+    id           = Column(String,  primary_key=True, default=_uuid)
+    recording_id = Column(String,  ForeignKey("recordings.id"), nullable=False, unique=True)
+    summary      = Column(Text,    default="")
+    key_points   = Column(Text,    default="[]")   # JSON array
+    action_items = Column(Text,    default="[]")   # JSON array
+    topics       = Column(Text,    default="[]")   # JSON array
+    sentiment    = Column(String,  default="neutral")
+    mindmap_json = Column(Text,    nullable=True)   # JSON mindmap tree
+    minutes_text = Column(Text,    nullable=True)   # Markdown biên bản họp
+    created_at   = Column(DateTime, default=_now)
+    updated_at   = Column(DateTime, default=_now, onupdate=_now)
+
+    recording = relationship("Recording", back_populates="summary")
 
 
 def get_engine(db_path: str = DB_PATH):
