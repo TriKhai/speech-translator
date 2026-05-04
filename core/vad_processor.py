@@ -17,7 +17,7 @@ class VADProcessor:
         threshold:       float    = 0.5,
         min_speech_ms:   int      = 200,
         min_silence_ms:  int      = 300,
-        max_speech_ms:   int      = 3000,
+        max_speech_ms:   int      = 30000,
     ):
         self._on_speech_chunk = on_speech_chunk
         self._threshold       = threshold
